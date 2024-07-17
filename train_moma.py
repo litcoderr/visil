@@ -4,6 +4,7 @@ import ndjson
 import argparse
 import numpy as np
 
+from tqdm import tqdm
 from pathlib import Path
 from torchvision.transforms import Compose
 from torch.utils.data import Dataset, DataLoader
@@ -147,24 +148,17 @@ def extract_features(model, frames, args):
         return model.extract_features(frames.to(args.gpu_id).float())
 
 
-def calculate_similarities_to_queries(model, query, target, args):
+def calculate_similarities_to_queries(model, query, target):
     return model.calculate_video_similarity(query, target)
 
 
 if __name__ == "__main__":
     formatter = lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=80)
     parser = argparse.ArgumentParser(description='This is the code for the evaluation of ViSiL network on five datasets.', formatter_class=formatter)
-    parser.add_argument('--batch_sz', type=int, default=128,
-                        help='Number of frames contained in each batch during feature extraction.')
-    parser.add_argument('--batch_sz_sim', type=int, default=2048,
-                        help='Number of feature tensors in each batch during similarity calculation.')
+    parser.add_argument('--n_epoch', type=int, default=10000,
+                        help='Number of epochs during training')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='Id of the GPU used.')
-    parser.add_argument('--load_queries', action='store_true',
-                        help='Flag that indicates that the queries will be loaded to the GPU memory.')
-    parser.add_argument('--similarity_function', type=str, default='chamfer', choices=["chamfer", "symmetric_chamfer"],
-                        help='Function that will be used to calculate similarity '
-                             'between query-target frames and videos.')
     parser.add_argument('--workers', type=int, default=8,
                         help='Number of workers used for video loading.')
     args = parser.parse_args()
@@ -176,15 +170,18 @@ if __name__ == "__main__":
     model = model.to('cuda')
 
     dataset = MOMADataset("train")
-    anchor, pair, sim = dataset[0]
+    dataloader = DataLoader(dataset, shuffle=True, num_workers=args.workers)
 
-    anchor_vid = anchor['vid']
-    pair_vid = pair['vid']
-    
-    # 1. extract features
-    anchor_feat = extract_features(model, anchor_vid, args)  # [n_frames, n_channels, dim]
-    pair_feat = extract_features(model, pair_vid, args)  # [n_frames, n_channels, dim]
+    for epoch in tqdm(range(args.n_epoch), desc='epoch'):
+        for batch in tqdm(dataloader, desc='iteration'):
+            anchor_vid = batch[0]['vid'][0]
+            pair_vid = batch[1]['vid'][0]
+            gt_sim = batch[2].to('cuda')
 
-    # 2. calculate similarities
-    sim = calculate_similarities_to_queries(model, anchor_feat, pair_feat, args)
-    print("")
+            # 1. extract features
+            anchor_feat = extract_features(model, anchor_vid, args)  # [n_frames, n_channels, dim]
+            pair_feat = extract_features(model, pair_vid, args)  # [n_frames, n_channels, dim]
+
+            # 2. calculate similarities
+            sim = calculate_similarities_to_queries(model, anchor_feat, pair_feat)
+            print("")
