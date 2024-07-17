@@ -1,5 +1,7 @@
+import cv2
 import torch
 import ndjson
+import argparse
 import numpy as np
 
 from pathlib import Path
@@ -9,34 +11,59 @@ from torch.utils.data import Dataset, DataLoader
 from model.visil import ViSiL
 
 
-class ToTensorNormalize(object):
-    def __init__(self, use_ms=True):
-        self.mean = [0.485, 0.456, 0.406]
-        self.std = [0.229, 0.224, 0.225]
-        self.use_ms = use_ms
+def center_crop(frame, desired_size):
+    if frame.ndim == 3:
+        old_size = frame.shape[:2]
+        top = int(np.maximum(0, (old_size[0] - desired_size)/2))
+        left = int(np.maximum(0, (old_size[1] - desired_size)/2))
+        return frame[top: top+desired_size, left: left+desired_size, :]
+    else: 
+        old_size = frame.shape[1:3]
+        top = int(np.maximum(0, (old_size[0] - desired_size)/2))
+        left = int(np.maximum(0, (old_size[1] - desired_size)/2))
+        return frame[:, top: top+desired_size, left: left+desired_size, :]
 
-    def __call__(self, frames):
-        # swap color axis because
-        # numpy image: H x W x C
-        # torch image: C x H x W
-        frames = torch.from_numpy(frames).float()
-        frames = frames.permute(3, 0, 1, 2)
-        frames /= 255
+def resize_frame(frame, desired_size):
+    min_size = np.min(frame.shape[:2])
+    ratio = desired_size / min_size
+    frame = cv2.resize(frame, dsize=(0, 0), fx=ratio, fy=ratio, interpolation=cv2.INTER_CUBIC)
+    return frame
 
-        if self.use_ms:
-            for fi, (f, m, s) in enumerate(zip(frames, self.mean, self.std)):
-                frames[fi] = (f - m) / s
+def load_video(video, all_frames=False, fps=1, cc_size=224, rs_size=256):
+    cv2.setNumThreads(1)
+    cap = cv2.VideoCapture(video)
+    fps_div = fps
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps > 144 or fps is None:
+        fps = 25
+    frames = []
+    count = 0
+    while cap.isOpened():
+        ret = cap.grab()
+        if int(count % round(fps / fps_div)) == 0 or all_frames:
+            ret, frame = cap.retrieve()
+            if isinstance(frame, np.ndarray):
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if rs_size is not None:
+                    frame = resize_frame(frame, rs_size)
+                frames.append(frame)
+            else:
+                break
+        count += 1
+    cap.release()
+    frames = np.array(frames)
+    if cc_size is not None:
+        frames = center_crop(frames, cc_size)
+    return torch.from_numpy(frames)
 
-        return frames
 
 class MOMADataset(Dataset):
     def __init__(self, split="train", tail_range=400):
         super().__init__()
-        self.tail_range = tail_range
         self.split = split
         self.root_dir = Path("/data/dir_moma")
         self.anno = self._load_anno_data()
-        self.transform = Compose([ToTensorNormalize()])
+        self.tail_range = tail_range
 
         self._load_pairwise_similarity()
         if split == "val" or split == "test":
@@ -84,43 +111,80 @@ class MOMADataset(Dataset):
         return len(self.anno)
     
     def __getitem__(self, idx):
-        feat_root = Path("/data/dir_moma/videos/resnet_feats")
+        vid_root = Path("/data/dir_moma/videos/raw")
 
         if self.split == "train":
             # read anchor video
             anchor_id = self.anno[idx]['video_id']
-            anchor_tensor = torch.from_numpy(np.load(feat_root / f"{anchor_id}.npy"))
-            anchor_tensor = anchor_tensor[:min(400, anchor_tensor.shape[0]), :, :]
+            anchor_vid = load_video(str(vid_root / f"{anchor_id}.mp4"))
 
             # sample pair with similarity to anchor
             pair_idx, sim = self.sample_pair(idx)
             pair_id = self.anno[pair_idx]['video_id']
-            pair_tensor = torch.from_numpy(np.load(feat_root / f"{pair_id}.npy"))
-            pair_tensor = pair_tensor[:min(400, pair_tensor.shape[0]), :, :]
+            pair_vid = load_video(str(vid_root / f"{pair_id}.mp4"))
 
             anchor = {
                 'video_id': self.anno[idx]['video_id'],
                 'cname': self.anno[idx]['cname'],
-                'feat': anchor_tensor
+                'vid': anchor_vid
             }
             pair = {
                 'video_id': self.anno[pair_idx]['video_id'],
                 'cname': self.anno[pair_idx]['cname'],
-                'feat': pair_tensor
+                'vid': pair_vid
             }
 
             return anchor, pair, sim
         else:
             batch = self.batches[idx]
-            query_tensor = torch.from_numpy(np.load(feat_root / f"{batch['query_video_id']}.npy"))
-            query_tensor = query_tensor[:min(400, query_tensor.shape[0]), :, :]
-            batch['query_video'] = query_tensor
+            query_vid = load_video(str(vid_root / f"{batch['query_video_id']}.mp4"))
+            batch['query_video'] = query_vid
             return batch
+        
+
+def extract_features(model, frames, args):
+    with torch.no_grad():
+        return model.extract_features(frames.to(args.gpu_id).float())
+
+
+def calculate_similarities_to_queries(model, query, target, args):
+    return model.calculate_video_similarity(query, target)
 
 
 if __name__ == "__main__":
+    formatter = lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=80)
+    parser = argparse.ArgumentParser(description='This is the code for the evaluation of ViSiL network on five datasets.', formatter_class=formatter)
+    parser.add_argument('--batch_sz', type=int, default=128,
+                        help='Number of frames contained in each batch during feature extraction.')
+    parser.add_argument('--batch_sz_sim', type=int, default=2048,
+                        help='Number of feature tensors in each batch during similarity calculation.')
+    parser.add_argument('--gpu_id', type=int, default=0,
+                        help='Id of the GPU used.')
+    parser.add_argument('--load_queries', action='store_true',
+                        help='Flag that indicates that the queries will be loaded to the GPU memory.')
+    parser.add_argument('--similarity_function', type=str, default='chamfer', choices=["chamfer", "symmetric_chamfer"],
+                        help='Function that will be used to calculate similarity '
+                             'between query-target frames and videos.')
+    parser.add_argument('--workers', type=int, default=8,
+                        help='Number of workers used for video loading.')
+    args = parser.parse_args()
+
+    model = ViSiL(pretrained=False)
+    # Fix parameters of resnet feature extractor
+    for param in model.cnn.parameters():
+        param.requires_grad = False
+    model = model.to('cuda')
+
     dataset = MOMADataset("train")
     anchor, pair, sim = dataset[0]
 
-    #model = ViSiL(pretrained=False)
+    anchor_vid = anchor['vid']
+    pair_vid = pair['vid']
+    
+    # 1. extract features
+    anchor_feat = extract_features(model, anchor_vid, args)  # [n_frames, n_channels, dim]
+    pair_feat = extract_features(model, pair_vid, args)  # [n_frames, n_channels, dim]
+
+    # 2. calculate similarities
+    sim = calculate_similarities_to_queries(model, anchor_feat, pair_feat, args)
     print("")
