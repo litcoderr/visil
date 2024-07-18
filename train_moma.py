@@ -1,4 +1,5 @@
 import cv2
+import wandb
 import torch
 import ndjson
 import argparse
@@ -8,8 +9,8 @@ import pytorch_lightning as pl
 
 from tqdm import tqdm
 from pathlib import Path
-from torchvision.transforms import Compose
 from torch.utils.data import Dataset, DataLoader
+from lightning.pytorch.loggers.wandb import WandbLogger
 
 from model.visil import ViSiL
 
@@ -57,7 +58,12 @@ def load_video(video, all_frames=False, fps=1, cc_size=224, rs_size=256):
     frames = np.array(frames)
     if cc_size is not None:
         frames = center_crop(frames, cc_size)
-    return torch.from_numpy(frames)
+    
+    frames = torch.from_numpy(frames)
+    # duplicate if video is too short
+    if frames.shape[0] < 10:
+        frames = torch.cat([frames, frames], dim=0)
+    return frames
 
 
 class MOMADataset(Dataset):
@@ -206,6 +212,8 @@ class VisilWrapper(pl.LightningModule):
         self.eval_query_ids = []
         self.eval_trg_ids = []
         self.eval_sim_ids = []
+        self.ndcg_metric = nDCGMetric([5, 10, 20, 40])
+        self.mse_error = MSEError()
     
     def forward(self, anchor, pair):
         with torch.no_grad():
@@ -239,8 +247,41 @@ class VisilWrapper(pl.LightningModule):
     
     def validation_epoch_end(self, _):
         # TODO implement calculating similarities between query and trg and log ndcg metric
-        pass
-    
+        for query_id, trg_ids, sim in tqdm(list(zip(
+            self.eval_query_ids,
+            self.eval_trg_ids,
+            self.eval_sim_ids
+        )), desc="validation epoch end"):
+            query_emb = self.id2emb[query_id].to("cuda")
+            preds = []
+            for trg_id in trg_ids:
+                trg_emb = self.id2emb[trg_id].to("cuda")
+                pred = self.model.calculate_video_similarity(query_emb, trg_emb)
+                preds.append(pred)
+            preds = torch.stack(preds, dim=0).squeeze(-1)
+            self.ndcg_metric.update(preds, sim)
+            self.mse_error.update(preds, sim)
+        
+        score = self.ndcg_metric.compute()
+        score['mse_error'] = self.mse_error.compute()
+        for k, v in score.items():
+            self.log(
+                f"val/{k}",
+                v,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
+            )
+
+        self.id2emb = {}
+        self.eval_query_ids = []
+        self.eval_trg_ids = []
+        self.eval_sim_ids = []
+        self.ndcg_metric.reset()
+        self.mse_error.reset() 
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.args.lr
@@ -252,16 +293,22 @@ if __name__ == "__main__":
     formatter = lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=80)
     parser = argparse.ArgumentParser(description='This is the code for the evaluation of ViSiL network on five datasets.', formatter_class=formatter)
     parser.add_argument('--lr', type=float, default=1e-5,
-                        help='Number of epochs during training')
+                        help='learning rate')
     parser.add_argument('--n_epoch', type=int, default=100000000,
                         help='Number of epochs during training')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='Id of the GPU used.')
     parser.add_argument('--workers', type=int, default=8,
                         help='Number of workers used for video loading.')
+    parser.add_argument('--project', type=str, default="visil",
+                        help='project name on wandb')
+    parser.add_argument('--run', type=str, default="moma_v1",
+                        help='run name on wandb')
     args = parser.parse_args()
+    wandb.init(config=args, project=args.project, name=args.run)
 
     model = VisilWrapper(args)
+    wandb.watch(model, log_freq=100)
 
     train_dataset = MOMADataset("train")
     train_dataloader = DataLoader(train_dataset, shuffle=True, num_workers=args.workers)
@@ -272,9 +319,10 @@ if __name__ == "__main__":
         accelerator='gpu',
         devices=[args.gpu_id],
         strategy='ddp',
+        logger=WandbLogger(project=args.project, name=args.run),
         log_every_n_steps=1,
         check_val_every_n_epoch=5,
-        num_sanity_val_steps=len(val_dataset),  # TODO set to 0
+        num_sanity_val_steps=0,
         max_epochs=args.n_epoch
     )
     trainer.fit(model, train_dataloader, val_dataloader)

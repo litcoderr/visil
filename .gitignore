@@ -16,3 +16,6 @@ venv/
 
 # Ignore lightning logs
 lightning_logs/
+
+# Ignore wandb logs
+wandb/
