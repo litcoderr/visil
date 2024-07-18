@@ -1,0 +1,18 @@
+# Ignore Python bytecode files
+__pycache__/
+*.py[cod]
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Ignore environment files
+.env
+.venv
+env/
+venv/
+
+# Ignore log files
+*.log
+
+# Ignore lightning logs
+lightning_logs/

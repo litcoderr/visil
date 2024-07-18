@@ -3,6 +3,8 @@ import torch
 import ndjson
 import argparse
 import numpy as np
+import torch.nn as nn
+import pytorch_lightning as pl
 
 from tqdm import tqdm
 from pathlib import Path
@@ -141,21 +143,117 @@ class MOMADataset(Dataset):
             query_vid = load_video(str(vid_root / f"{batch['query_video_id']}.mp4"))
             batch['query_video'] = query_vid
             return batch
+
+
+class nDCGMetric:
+    def __init__(self, topK):
+        self.topK = topK
+        self.score = {f"nDCG@{k}": [] for k in self.topK}
+            
+    def update(self, pred, proxy):
+        _, pred_idx = torch.topk(pred, max(self.topK))
+        _, opt_idx = torch.topk(proxy, max(self.topK))
+
+        # proxy = torch.clamp(proxy, min=0.5)
+        # proxy = (proxy - proxy.min()) / (proxy.max() - proxy.min())
+
+        for k in self.topK:
+            pred_rel = proxy[pred_idx[:k]]
+            opt_rel = proxy[opt_idx[:k]]
+            
+            dcg = ((2**pred_rel - 1) / torch.log2(torch.arange(2, k+2)).to("cuda")).sum()
+            idcg = ((2**opt_rel - 1) / torch.log2(torch.arange(2, k+2)).to("cuda")).sum()
+            
+            self.score[f"nDCG@{k}"].append(dcg / idcg)
+        
+    def compute(self):
+        return {
+            k: torch.tensor(v).mean() for k, v in self.score.items()
+        }
+        
+    def reset(self):
+        self.score = {f"nDCG@{k}": [] for k in self.topK}
         
 
-def extract_features(model, frames, args):
-    with torch.no_grad():
-        return model.extract_features(frames.to(args.gpu_id).float())
+class MSEError:
+    def __init__(self):
+        self.mse_log = []
+        
+    def update(self, pred_similarities, proxy_similarities):
+        diff = pred_similarities - proxy_similarities
+        self.mse_log.append((diff ** 2).mean())
+        
+    def compute(self):
+        return torch.tensor(self.mse_log).mean()
+        
+    def reset(self):
+        self.mse_log = []
 
 
-def calculate_similarities_to_queries(model, query, target):
-    return model.calculate_video_similarity(query, target)
+class VisilWrapper(pl.LightningModule):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+    
+        self.model = ViSiL(pretrained=False)
+        for param in self.model.cnn.parameters():
+            param.requires_grad = False
+        
+        self.mse_loss = nn.MSELoss(reduction='mean')
+        
+        # for evaluation
+        self.id2emb = {}
+        self.eval_query_ids = []
+        self.eval_trg_ids = []
+        self.eval_sim_ids = []
+    
+    def forward(self, anchor, pair):
+        with torch.no_grad():
+            anchor = self.model.extract_features(anchor.float())
+            pair = self.model.extract_features(pair.float())
+        return self.model.calculate_video_similarity(anchor, pair)
+    
+    def training_step(self, batch):
+        anchor_vid = batch[0]['vid'][0]
+        pair_vid = batch[1]['vid'][0]
+        gt = batch[2]  # gt similarity between anchor and pair
+        pred = self(anchor_vid, pair_vid)  # similarity prediction
+
+        loss = self.mse_loss(pred, gt)
+        self.log(
+            "train/loss",
+            loss,
+            on_step=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True
+        )
+        return loss
+    
+    def validation_step(self, batch, _):
+        if batch['query_video_id'] not in self.id2emb:
+            self.id2emb[batch['query_video_id']] = self.model.extract_features(batch['query_video'].float()).cpu()
+        self.eval_query_ids.append(batch['query_video_id'])
+        self.eval_trg_ids.append(batch['trg_video_ids'])
+        self.eval_sim_ids.append(batch['similarities'])
+    
+    def validation_epoch_end(self, _):
+        # TODO implement calculating similarities between query and trg and log ndcg metric
+        pass
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=self.args.lr
+        )
+        return optimizer
 
 
 if __name__ == "__main__":
     formatter = lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=80)
     parser = argparse.ArgumentParser(description='This is the code for the evaluation of ViSiL network on five datasets.', formatter_class=formatter)
-    parser.add_argument('--n_epoch', type=int, default=10000,
+    parser.add_argument('--lr', type=float, default=1e-5,
+                        help='Number of epochs during training')
+    parser.add_argument('--n_epoch', type=int, default=100000000,
                         help='Number of epochs during training')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='Id of the GPU used.')
@@ -163,25 +261,20 @@ if __name__ == "__main__":
                         help='Number of workers used for video loading.')
     args = parser.parse_args()
 
-    model = ViSiL(pretrained=False)
-    # Fix parameters of resnet feature extractor
-    for param in model.cnn.parameters():
-        param.requires_grad = False
-    model = model.to('cuda')
+    model = VisilWrapper(args)
 
-    dataset = MOMADataset("train")
-    dataloader = DataLoader(dataset, shuffle=True, num_workers=args.workers)
+    train_dataset = MOMADataset("train")
+    train_dataloader = DataLoader(train_dataset, shuffle=True, num_workers=args.workers)
+    val_dataset = MOMADataset("test")
+    val_dataloader = DataLoader(val_dataset, shuffle=True, num_workers=args.workers, collate_fn=lambda x: x[0])
 
-    for epoch in tqdm(range(args.n_epoch), desc='epoch'):
-        for batch in tqdm(dataloader, desc='iteration'):
-            anchor_vid = batch[0]['vid'][0]
-            pair_vid = batch[1]['vid'][0]
-            gt_sim = batch[2].to('cuda')
-
-            # 1. extract features
-            anchor_feat = extract_features(model, anchor_vid, args)  # [n_frames, n_channels, dim]
-            pair_feat = extract_features(model, pair_vid, args)  # [n_frames, n_channels, dim]
-
-            # 2. calculate similarities
-            sim = calculate_similarities_to_queries(model, anchor_feat, pair_feat)
-            print("")
+    trainer = pl.Trainer(
+        accelerator='gpu',
+        devices=[args.gpu_id],
+        strategy='ddp',
+        log_every_n_steps=1,
+        check_val_every_n_epoch=5,
+        num_sanity_val_steps=len(val_dataset),  # TODO set to 0
+        max_epochs=args.n_epoch
+    )
+    trainer.fit(model, train_dataloader, val_dataloader)
