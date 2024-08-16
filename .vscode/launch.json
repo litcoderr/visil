@@ -8,7 +8,7 @@
             "name": "Train MOMA",
             "type": "debugpy",
             "request": "launch",
-            "module": "train_moma"
+            "module": "train_moma_triplet"
         }
     ]
 }

@@ -1,6 +1,7 @@
 import cv2
 import wandb
 import torch
+import random
 import ndjson
 import argparse
 import numpy as np
@@ -67,16 +68,21 @@ def load_video(video, all_frames=False, fps=1, cc_size=224, rs_size=256):
 
 
 class MOMADataset(Dataset):
-    def __init__(self, split="train", tail_range=400):
+    def __init__(self, split="train", tail_range=400, thr=0.3):
         super().__init__()
+        self.thr = thr
         self.split = split
         self.root_dir = Path("/data/dir_moma")
         self.anno = self._load_anno_data()
         self.tail_range = tail_range
-
+        self.pos, self.neg = self._load_triplet()
+        
         self._load_pairwise_similarity()
-        if split == "val" or split == "test":
-            self._prepare_val_batches()
+        self._prepare_val_batches()
+
+    def _load_pairwise_similarity(self):
+        self.sm = np.load(f"anno/moma/sm_dtw_{self.split}.npy")
+        self.sm = torch.from_numpy(self.sm).float()
 
     def _prepare_val_batches(self):
         self.batches = []
@@ -94,27 +100,21 @@ class MOMADataset(Dataset):
             
             self.batches.append(batch)
 
+
+    def _load_triplet(self):
+        pos = np.load(f"anno/moma/triplet/{self.split}_pos_thr={self.thr}.npy")
+        neg = np.load(f"anno/moma/triplet/{self.split}_neg_thr={self.thr}.npy")
+        return pos, neg
+
     def _load_anno_data(self):
         with open(f"anno/moma/{self.split}.ndjson", "r") as f:
             return ndjson.load(f)
     
-    def _load_pairwise_similarity(self):
-        self.sm = np.load(f"anno/moma/sm_dtw_{self.split}.npy")
-        self.sm = torch.from_numpy(self.sm).float()
-    
-    def sample_pair(self, idx):
-        similarties = self.sm[idx]
-        _, sorted_idx = torch.sort(similarties, descending=True)
-        mask = (sorted_idx != idx)
-        sorted_idx = sorted_idx[mask]
-        
-        # oversampling
-        if np.random.rand(1) < 0.5:
-            pair_idx = sorted_idx[np.random.randint(self.tail_range)]
-        else:
-            pair_idx = sorted_idx[np.random.randint(len(sorted_idx))]
+    def sample_triplet(self, idx):
+        pos_idx = np.random.choice(self.pos[idx])
+        neg_idx = np.random.choice(self.neg[idx])
 
-        return pair_idx, similarties[pair_idx]
+        return pos_idx, neg_idx
     
     def __len__(self):
         return len(self.anno)
@@ -128,22 +128,27 @@ class MOMADataset(Dataset):
             anchor_vid = load_video(str(vid_root / f"{anchor_id}.mp4"))
 
             # sample pair with similarity to anchor
-            pair_idx, sim = self.sample_pair(idx)
-            pair_id = self.anno[pair_idx]['video_id']
-            pair_vid = load_video(str(vid_root / f"{pair_id}.mp4"))
+            pos_idx, neg_idx = self.sample_triplet(idx)
+
+            pos_id = self.anno[pos_idx]['video_id']
+            pos_vid = load_video(str(vid_root / f"{pos_id}.mp4"))
+            neg_id = self.anno[neg_idx]['video_id']
+            neg_vid = load_video(str(vid_root / f"{neg_id}.mp4"))
 
             anchor = {
-                'video_id': self.anno[idx]['video_id'],
-                'cname': self.anno[idx]['cname'],
+                'video_id': anchor_id,
                 'vid': anchor_vid
             }
-            pair = {
-                'video_id': self.anno[pair_idx]['video_id'],
-                'cname': self.anno[pair_idx]['cname'],
-                'vid': pair_vid
+            pos = {
+                'video_id': pos_vid,
+                'vid': pos_vid,
+            }
+            neg = {
+                'video_id': neg_vid,
+                'vid': neg_vid,
             }
 
-            return anchor, pair, sim
+            return anchor, pos, neg
         else:
             batch = self.batches[idx]
             query_vid = load_video(str(vid_root / f"{batch['query_video_id']}.mp4"))
@@ -223,11 +228,15 @@ class VisilWrapper(pl.LightningModule):
     
     def training_step(self, batch):
         anchor_vid = batch[0]['vid'][0]
-        pair_vid = batch[1]['vid'][0]
-        gt = batch[2]  # gt similarity between anchor and pair
-        pred = self(anchor_vid, pair_vid)  # similarity prediction
+        pos_vid = batch[1]['vid'][0]
+        neg_vid = batch[2]['vid'][0]
 
-        loss = self.mse_loss(pred, gt)
+        pos_pred = self(anchor_vid, pos_vid)  # similarity prediction
+        neg_pred = self(anchor_vid, neg_vid)  # similarity prediction
+
+        triplet_loss = neg_pred - pos_pred + 0.5  # minimize neg_pred and maximize pos_pred
+        loss = torch.clamp(triplet_loss, min=0)
+
         self.log(
             "train/loss",
             loss,
@@ -302,7 +311,7 @@ if __name__ == "__main__":
                         help='Number of workers used for video loading.')
     parser.add_argument('--project', type=str, default="visil",
                         help='project name on wandb')
-    parser.add_argument('--run', type=str, default="weight_n_count",
+    parser.add_argument('--run', type=str, default="moma_triplet_thr=0.3_gamma=0.5",
                         help='run name on wandb')
     args = parser.parse_args()
     wandb.init(config=args, project=args.project, name=args.run)
@@ -310,9 +319,9 @@ if __name__ == "__main__":
     model = VisilWrapper(args)
     wandb.watch(model, log_freq=100)
 
-    train_dataset = MOMADataset("train")
+    train_dataset = MOMADataset("train", thr=0.3)
     train_dataloader = DataLoader(train_dataset, shuffle=True, num_workers=args.workers)
-    val_dataset = MOMADataset("test")
+    val_dataset = MOMADataset("test", thr=0.3)
     val_dataloader = DataLoader(val_dataset, shuffle=True, num_workers=args.workers, collate_fn=lambda x: x[0])
 
     trainer = pl.Trainer(
